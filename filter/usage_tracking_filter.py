@@ -1,8 +1,8 @@
 """
 title: Usage Tracking Filter
 author: beaudamore
-date: 2026-10-07
-version: 1.0.1
+date: 2026-10-24
+version: 1.1.0
 license: MIT
 description: Token usage tracking and group-based rate limiting with PostgreSQL persistence
 required_open_webui_version: >= 0.5.0
@@ -15,7 +15,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from pydantic import BaseModel, Field
 from fastapi import Request
@@ -54,14 +54,10 @@ class Filter:
             description="Filter execution priority. Set LOWER than other filters (e.g., 5) so usage check runs FIRST. Memory filter should be 10+."
         )
         
-        # PostgreSQL Configuration
-        postgres_host: str = Field(
-            default="langgraph-postgres",
-            description="PostgreSQL host (use same as memory filter if sharing)"
-        )
-        postgres_port: int = Field(
-            default=5432,
-            description="PostgreSQL port"
+        # PostgreSQL address. Independent of how the database is deployed.
+        postgres_url: str = Field(
+            default="",
+            description="URL of the PostgreSQL server: scheme://host or scheme://host:port (port defaults to 5432). The scheme is http, https or postgresql. Examples: http://langgraph-pgvector, http://10.5.10.100:5432, https://db.example.org:5435. Required.",
         )
         postgres_database: str = Field(
             default="langgraph_memory",
@@ -404,14 +400,21 @@ class Filter:
 
     def _connect(self):
         """Blocking: open the connection pool and ensure the schema. Runs in a worker thread."""
+        url = urlparse(self.valves.postgres_url.strip())
+        if url.scheme not in ("http", "https", "postgresql", "postgres") or not url.hostname:
+            raise ValueError(
+                "Valve postgres_url must be scheme://host or scheme://host:port, "
+                "e.g. http://langgraph-pgvector or http://10.5.10.100:5432."
+            )
+        host, port = url.hostname, url.port or 5432
         conn_string = (
             f"postgresql://{self.valves.postgres_user}:"
             f"{quote_plus(self.valves.postgres_password)}@"
-            f"{self.valves.postgres_host}:{self.valves.postgres_port}/"
+            f"{host}:{port}/"
             f"{self.valves.postgres_database}"
         )
 
-        self._log(f"Connecting to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}")
+        self._log(f"Connecting to PostgreSQL at {host}:{port}")
 
         pool = psycopg_pool.ConnectionPool(
             conninfo=conn_string,

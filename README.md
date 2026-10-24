@@ -142,8 +142,7 @@ All settings live in the function's Valves panel. Behaviour settings take effect
 | Valve | Default | Description |
 | --- | --- | --- |
 | `priority` | `5` | Filter execution order. Lower runs first. Keep this below your other filters. |
-| `postgres_host` | `langgraph-postgres` | PostgreSQL hostname or container name. |
-| `postgres_port` | `5432` | PostgreSQL port. |
+| `postgres_url` | (required) | PostgreSQL server address, `scheme://host` or `scheme://host:port` (port defaults to 5432); the scheme is `http`, `https` or `postgresql`. Examples: `http://langgraph-pgvector`, `http://10.5.10.100:5432`. |
 | `postgres_database` | `langgraph_memory` | Database to use. **Must already exist.** |
 | `postgres_user` | `langgraph` | Database user. |
 | `postgres_password` | `langgraph_password_change_me` | Database password. Change it. Stored in Open WebUI's database like any other valve. |
@@ -467,7 +466,7 @@ networks:
 
 `POSTGRES_DB` creates the database on first start, which is the one thing the filter cannot do for itself. Setting the timezone to UTC makes the "resets at midnight UTC" message accurate.
 
-If Open WebUI runs on the host rather than in Docker, publish the port (`ports: ["5432:5432"]`) and set `postgres_host` to `localhost` or the host's IP.
+If Open WebUI runs on the host rather than in Docker, publish the port (`ports: ["5432:5432"]`) and set `postgres_url` to `http://localhost` or `http://<host ip>`.
 
 ## Upgrading
 
@@ -542,6 +541,10 @@ openwebui-usage-tracking-filter/
 The schema SQL lives inside the filter so that a single paste installs everything.
 
 ## Changelog
+
+### 1.1.0 (2026-10-24)
+
+- Valves `postgres_host` and `postgres_port` replaced by one `postgres_url` valve (`scheme://host` or `scheme://host:port`, port defaults to 5432), the same format the User Memory filter uses. Existing installs must set `postgres_url`; the old host/port values are ignored.
 
 ### 1.0.1 (2026-10-07)
 
