@@ -1,21 +1,24 @@
 """
-title: Usage Tracking Filter
-author: beaudamore
-date: 2026-10-24
-version: 1.1.0
+title: Gettysburg Usage Tracking Filter
+author: Beau D'Amore (original), Nathan I Keiter (Gettysburg College fork) nkeiter@gettysburg.edu
+date: 2026-10-26
+version: 1.5.0
 license: MIT
-description: Token usage tracking and group-based rate limiting with PostgreSQL persistence
-required_open_webui_version: >= 0.5.0
+description: Token usage tracking and group-based rate limiting with PostgreSQL persistence.
+required_open_webui_version: >= 0.12.4
 requirements: psycopg[binary], psycopg-pool
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 
 from pydantic import BaseModel, Field
 from fastapi import Request
@@ -28,91 +31,119 @@ import psycopg_pool
 logger = logging.getLogger("openwebui.filters.usage_tracking")
 logger.setLevel(logging.INFO)
 
+PLUGIN_NAME = "Gettysburg Usage Tracking Filter"
+TIER_GROUP_PREFIX = "token-limit-"
+DEFAULT_GROUP = f"{TIER_GROUP_PREFIX}standard"
+DEFAULT_USAGE_TIMEZONE = "America/New_York"
 
-class UsageLimitExceeded(Exception):
-    """Raised from inlet to stop the request. Open WebUI shows the message to the user."""
+# Adjust the prefix, tier names, quotas, and timezone to match the deployment.
+DEFAULT_TIERS = [
+    {
+        "group_name": f"{TIER_GROUP_PREFIX}enterprise",
+        "daily_token_limit": -1,
+        "monthly_token_limit": -1,
+        "description": "Enterprise tier - unlimited",
+    },
+    {
+        "group_name": f"{TIER_GROUP_PREFIX}pro",
+        "daily_token_limit": 1000000,
+        "monthly_token_limit": 10000000,
+        "description": "Pro tier - 1M/day, 10M/month",
+    },
+    {
+        "group_name": DEFAULT_GROUP,
+        "daily_token_limit": 500000,
+        "monthly_token_limit": 5000000,
+        "description": "Standard tier - 500K/day, 5M/month",
+    },
+    {
+        "group_name": f"{TIER_GROUP_PREFIX}test",
+        "daily_token_limit": 1000,
+        "monthly_token_limit": 5000,
+        "description": "Test tier - 1K/day, 5K/month",
+    },
+]
 
 
 class Filter:
     """
-    Usage Tracking Filter for Open WebUI
-    
+    Gettysburg College Usage Tracking Filter for Open WebUI
+
     Tracks token usage per user and enforces group-based limits.
     Stores only user UUIDs - no PII.
-    
+
+    Usage tiers are native Open WebUI groups, so membership is managed through the
+    standard Groups admin UI. On load, any missing configured tier group is created
+    in the native `group` table. Per-tier quotas are tracked in the filter's own
+    `usage_limits` table because Open WebUI's group UI has no concept of token quotas.
+
     Flow:
     - inlet(): Check if user is over daily/monthly limit → block if so
     - outlet(): Record token usage from response
     """
-    
+
     class Valves(BaseModel):
-        """Configuration for Usage Tracking Filter"""
-        
+        """Configuration for the usage tracking filter."""
+
         # Execution Priority - MUST run before other filters
         priority: int = Field(
             default=5,
-            description="Filter execution priority. Set LOWER than other filters (e.g., 5) so usage check runs FIRST. Memory filter should be 10+."
+            description="Filter execution priority. Set lower than filters that should run after the usage check (e.g., 5).",
         )
-        
-        # PostgreSQL address. Independent of how the database is deployed.
-        postgres_url: str = Field(
-            default="",
-            description="URL of the PostgreSQL server: scheme://host or scheme://host:port (port defaults to 5432). The scheme is http, https or postgresql. Examples: http://langgraph-pgvector, http://10.5.10.100:5432, https://db.example.org:5435. Required.",
+
+        # PostgreSQL Configuration
+        postgres_host: str = Field(
+            default="localhost",
+            description="PostgreSQL host reachable from Open WebUI",
         )
+        postgres_port: int = Field(default=5432, description="PostgreSQL port")
         postgres_database: str = Field(
-            default="langgraph_memory",
-            description="PostgreSQL database name (can share with memory filter)"
+            default="open_webui",
+            description="PostgreSQL database containing Open WebUI's user and group tables",
         )
         postgres_user: str = Field(
-            default="langgraph",
-            description="PostgreSQL username"
+            default="postgres", description="PostgreSQL username"
         )
         postgres_password: str = Field(
-            default="langgraph_password_change_me",
-            description="PostgreSQL password"
+            default="", description="PostgreSQL password"
         )
-        
+
         # Default Group
         default_group: str = Field(
-            default="freemium",
-            description="Tier applied to users with no row in user_groups. Must match a group_name in usage_limits; new users are auto-enrolled into it on their first recorded response."
+            default=DEFAULT_GROUP,
+            description="Default built-in tier; must match a group_name in DEFAULT_TIERS",
         )
-        
+
+        usage_timezone: str = Field(
+            default=DEFAULT_USAGE_TIMEZONE,
+            description="IANA timezone used for daily/monthly quota windows and resets",
+        )
+
         # Behavior Configuration
         enable_blocking: bool = Field(
             default=True,
-            description="Block requests when limits exceeded. If False, only logs warnings."
+            description="Block requests when limits exceeded. If False, only logs warnings.",
         )
         show_usage_status: bool = Field(
-            default=True,
-            description="Show usage status messages to users"
+            default=True, description="Show usage status messages to users"
         )
         warn_at_percent: int = Field(
             default=80,
-            description="Warn users when they reach this percentage of their limit"
-        )
-        
-        # Admin Bypass
-        admin_bypass: bool = Field(
-            default=True,
-            description="Allow admin users to bypass limits"
-        )
-        
-        # Debug
-        debug_mode: bool = Field(
-            default=False,
-            description="Enable detailed debug logging"
+            description="Warn users when they reach this percentage of their limit",
         )
 
-    class UserValves(BaseModel):
-        """Per-user configuration (users can change these themselves, so nothing here may weaken enforcement)"""
-        show_usage_status: bool = Field(
-            default=True,
-            description="Show the usage status line on your messages. Limit warnings and blocking are unaffected."
+        # Admin Bypass
+        admin_bypass: bool = Field(
+            default=True, description="Allow admin users to bypass limits"
+        )
+
+        # Debug
+        debug_mode: bool = Field(
+            default=False, description="Enable detailed debug logging"
         )
 
     def __init__(self):
-        self.name = "Usage Tracking Filter"
+        self.name = PLUGIN_NAME
         self.valves = self.Valves()
         self._pool = None
         self._initialized = False
@@ -126,23 +157,41 @@ class Filter:
         getattr(logger, level, logger.info)(f"[Usage Tracking] {message}")
 
     @staticmethod
-    def _user_wants_status(__user__: Optional[Dict[str, Any]]) -> bool:
-        """Read the per-user show_usage_status valve. Open WebUI injects it as __user__["valves"]."""
-        user_valves = (__user__ or {}).get("valves")
-        if user_valves is None:
-            return True
-        return bool(getattr(user_valves, "show_usage_status", True))
+    def _sql_string_literal(value: str) -> str:
+        """Escape a string for use as a SQL string literal."""
+        return "'" + value.replace("'", "''") + "'"
 
-    def _get_tables_sql(self) -> str:
-        """Tables, indexes and seed tiers. Run only when the schema is missing, so admin edits to tiers survive restarts."""
-        return """
+    def _get_schema_sql(self) -> str:
+        """Return the complete schema SQL for auto-creation"""
+        tiers_by_name = {tier["group_name"]: tier for tier in DEFAULT_TIERS}
+        default_tier = tiers_by_name.get(self.valves.default_group)
+        if default_tier is None:
+            raise ValueError("default_group must match a group_name in DEFAULT_TIERS")
+
+        tier_names_sql = ", ".join(
+            self._sql_string_literal(name) for name in tiers_by_name
+        )
+        tier_group_prefix_sql = self._sql_string_literal(TIER_GROUP_PREFIX)
+        tier_rows_sql = ",\n            ".join(
+            "("
+            f"{self._sql_string_literal(tier['group_name'])}, "
+            f"{int(tier['daily_token_limit'])}, "
+            f"{int(tier['monthly_token_limit'])}, "
+            f"{self._sql_string_literal(tier['description'])}"
+            ")"
+            for tier in DEFAULT_TIERS
+        )
+        default_group_sql = self._sql_string_literal(self.valves.default_group)
+        timezone_sql = self._sql_string_literal(self.valves.usage_timezone)
+
+        return f"""
         -- ============================================================================
         -- USAGE LIMITS: Group-based quota definitions
         -- ============================================================================
         CREATE TABLE IF NOT EXISTS usage_limits (
             group_name VARCHAR(50) PRIMARY KEY,
-            daily_token_limit BIGINT NOT NULL DEFAULT 1000000,
-            monthly_token_limit BIGINT NOT NULL DEFAULT 10000000,
+            daily_token_limit BIGINT NOT NULL DEFAULT {int(default_tier['daily_token_limit'])},
+            monthly_token_limit BIGINT NOT NULL DEFAULT {int(default_tier['monthly_token_limit'])},
             rate_limit_rpm INT,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -152,9 +201,7 @@ class Filter:
         -- Insert default tiers (skip if already exist)
         INSERT INTO usage_limits (group_name, daily_token_limit, monthly_token_limit, description)
         VALUES 
-            ('freemium', 1000000, 10000000, 'Free tier - 1M/day, 10M/month'),
-            ('pro', 5000000, 100000000, 'Pro tier - 5M/day, 100M/month'),
-            ('enterprise', -1, -1, 'Enterprise tier - unlimited (-1 = no limit)')
+            {tier_rows_sql}
         ON CONFLICT (group_name) DO NOTHING;
 
         -- ============================================================================
@@ -162,7 +209,7 @@ class Filter:
         -- ============================================================================
         CREATE TABLE IF NOT EXISTS user_groups (
             user_id VARCHAR(255) PRIMARY KEY,
-            group_name VARCHAR(50) NOT NULL REFERENCES usage_limits(group_name) DEFAULT 'freemium',
+            group_name VARCHAR(50) NOT NULL REFERENCES usage_limits(group_name) DEFAULT {default_group_sql},
             assigned_at TIMESTAMPTZ DEFAULT NOW(),
             assigned_by VARCHAR(255),
             notes TEXT
@@ -191,73 +238,216 @@ class Filter:
         CREATE INDEX IF NOT EXISTS idx_usage_records_date ON usage_records(recorded_at);
         CREATE INDEX IF NOT EXISTS idx_usage_records_user_date ON usage_records(user_id, recorded_at DESC);
         -- Note: Cannot use DATE(recorded_at) in index - not immutable. Use recorded_at::date in queries instead.
-        """
 
-    def _get_routines_sql(self) -> str:
-        """Views and functions. Idempotent; re-applied on every initialization so upgrades need no manual migration."""
-        return """
+        -- ============================================================================
+        -- USER LIMIT OVERRIDES: optional per-user limits (limits only - tier
+        -- membership always comes from native Open WebUI groups)
+        -- ============================================================================
+        CREATE TABLE IF NOT EXISTS user_limit_overrides (
+            user_id VARCHAR(255) PRIMARY KEY,
+            daily_token_limit BIGINT,
+            monthly_token_limit BIGINT,
+            notes TEXT,
+            updated_by VARCHAR(255),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- ============================================================================
+        -- TIER RESOLUTION: the single source of truth for what a user is allowed.
+        -- A tier is any native group with the configured prefix that has a row in usage_limits.
+        --   * DEFAULT tiers: the groups configured in DEFAULT_TIERS.
+        --     A user has at most ONE default tier; if several are present the MOST
+        --     RECENTLY ADDED membership wins (ties follow DEFAULT_TIERS order).
+        --     No default membership means the configured default_group.
+        --   * CUSTOM tiers: every other token-limit-* tier. A user may be in any number.
+        -- Limits: a user in one or more custom tiers gets the SUM of the custom tiers'
+        -- limits (the default tier is not included in the sum; any custom tier with -1
+        -- makes that limit unlimited). A user in no custom tier gets the default tier's
+        -- limits. Per-user overrides (user_limit_overrides) still win over both.
+        -- This function block is deployed together; keep its BEGIN/END markers intact.
+        -- ============================================================================
+        -- BEGIN tier-functions
+        -- The user's one default (built-in) tier, or NULL if they have none.
+        CREATE OR REPLACE FUNCTION resolve_user_tier(p_user_id VARCHAR)
+        RETURNS VARCHAR AS $$
+            SELECT g.name::VARCHAR
+            FROM "group" g
+            JOIN group_member gm ON gm.group_id = g.id AND gm.user_id = p_user_id
+            JOIN usage_limits ul ON ul.group_name = g.name::VARCHAR
+            WHERE g.name IN ({tier_names_sql})
+            ORDER BY gm.created_at DESC NULLS LAST,
+                COALESCE(array_position(
+                    ARRAY[{tier_names_sql}],
+                    g.name::TEXT
+                ), 99),
+                g.name
+            LIMIT 1;
+        $$ LANGUAGE sql STABLE;
+
+        -- Everything the user is a member of plus the limits that apply (before overrides).
+        --   tiers        every tier group the user is in (default tier first); configured default if none
+        --   default_tier the explicit default tier, or NULL
+        --   custom_tiers the custom tiers the user is in
+        --   limit_source 'custom' (sum of custom tiers), 'tier' (default tier) or 'default' (no membership)
+        CREATE OR REPLACE FUNCTION resolve_user_limits(p_user_id VARCHAR)
+        RETURNS TABLE (
+            tiers VARCHAR[],
+            default_tier VARCHAR,
+            custom_tiers VARCHAR[],
+            daily_limit BIGINT,
+            monthly_limit BIGINT,
+            limit_source VARCHAR
+        ) AS $$
+            SELECT
+                CASE WHEN dt.name IS NULL AND c.n = 0 THEN ARRAY[{default_group_sql}]::VARCHAR[]
+                     WHEN dt.name IS NULL THEN c.names
+                     ELSE ARRAY[dt.name]::VARCHAR[] || c.names END,
+                dt.name,
+                c.names,
+                (CASE WHEN c.n > 0 THEN c.d ELSE COALESCE(base.daily_token_limit, {int(default_tier['daily_token_limit'])}) END)::BIGINT,
+                (CASE WHEN c.n > 0 THEN c.m ELSE COALESCE(base.monthly_token_limit, {int(default_tier['monthly_token_limit'])}) END)::BIGINT,
+                (CASE WHEN c.n > 0 THEN 'custom' WHEN dt.name IS NOT NULL THEN 'tier' ELSE 'default' END)::VARCHAR
+            FROM (SELECT resolve_user_tier(p_user_id) AS name) dt
+            CROSS JOIN LATERAL (
+                SELECT COALESCE(array_agg(x.name ORDER BY x.name), ARRAY[]::VARCHAR[]) AS names,
+                       COUNT(*) AS n,
+                       (CASE WHEN bool_or(x.d = -1) THEN -1 ELSE SUM(x.d) END)::BIGINT AS d,
+                       (CASE WHEN bool_or(x.m = -1) THEN -1 ELSE SUM(x.m) END)::BIGINT AS m
+                FROM (
+                    SELECT g.name::VARCHAR AS name, ul.daily_token_limit AS d, ul.monthly_token_limit AS m
+                    FROM "group" g
+                    JOIN group_member gm ON gm.group_id = g.id AND gm.user_id = p_user_id
+                    JOIN usage_limits ul ON ul.group_name = g.name::VARCHAR
+                    WHERE starts_with(g.name, {tier_group_prefix_sql})
+                      AND g.name NOT IN ({tier_names_sql})
+                ) x
+            ) c
+            LEFT JOIN usage_limits base ON base.group_name = COALESCE(dt.name, {default_group_sql});
+        $$ LANGUAGE sql STABLE;
+
+        -- Get user's current limits and usage in one call. group_name lists every tier
+        -- the user is in (comma separated). A row in user_limit_overrides (limits only,
+        -- never membership) takes precedence over the tier limits.
+        DROP FUNCTION IF EXISTS get_user_usage_status(VARCHAR);
+        CREATE FUNCTION get_user_usage_status(p_user_id VARCHAR(255))
+        RETURNS TABLE (
+            group_name TEXT,
+            daily_limit BIGINT,
+            monthly_limit BIGINT,
+            tokens_today BIGINT,
+            tokens_this_month BIGINT,
+            is_over_daily BOOLEAN,
+            is_over_monthly BOOLEAN,
+            limit_source VARCHAR(20)
+        ) AS $$
+        BEGIN
+            RETURN QUERY
+            WITH t AS (
+                SELECT
+                    array_to_string(r.tiers, ', ')::TEXT AS tier,
+                    COALESCE(uo.daily_token_limit, r.daily_limit) AS dl,
+                    COALESCE(uo.monthly_token_limit, r.monthly_limit) AS ml,
+                    (CASE WHEN uo.user_id IS NOT NULL THEN 'override' ELSE r.limit_source END)::VARCHAR(20) AS src
+                FROM resolve_user_limits(p_user_id) r
+                LEFT JOIN user_limit_overrides uo ON uo.user_id = p_user_id
+            ),
+            d AS (
+                SELECT COALESCE(SUM(ur.total_tokens), 0)::BIGINT AS total
+                FROM usage_records ur
+                WHERE ur.user_id = p_user_id AND (ur.recorded_at AT TIME ZONE {timezone_sql})::date = (NOW() AT TIME ZONE {timezone_sql})::date
+            ),
+            m AS (
+                SELECT COALESCE(SUM(ur.total_tokens), 0)::BIGINT AS total
+                FROM usage_records ur
+                WHERE ur.user_id = p_user_id AND ur.recorded_at >= (DATE_TRUNC('month', NOW() AT TIME ZONE {timezone_sql}) AT TIME ZONE {timezone_sql})
+            )
+            SELECT
+                t.tier,
+                t.dl::BIGINT,
+                t.ml::BIGINT,
+                d.total,
+                m.total,
+                (t.dl <> -1 AND d.total >= t.dl),
+                (t.ml <> -1 AND m.total >= t.ml),
+                t.src
+            FROM t, d, m;
+        END;
+        $$ LANGUAGE plpgsql;
+        -- END tier-functions
+
         -- ============================================================================
         -- VIEWS: Convenient queries for common operations
         -- ============================================================================
 
+        -- CREATE OR REPLACE VIEW cannot change a column's data type (the timezone
+        -- pinning changed usage_month from timestamptz to timestamp), so drop the
+        -- views first (dependents before their sources). Views hold no data.
+        DROP VIEW IF EXISTS users_near_limit;
+        DROP VIEW IF EXISTS usage_summary;
+        DROP VIEW IF EXISTS usage_daily;
+        DROP VIEW IF EXISTS usage_monthly;
+
         -- Daily usage per user
-        CREATE OR REPLACE VIEW usage_daily AS
+        CREATE VIEW usage_daily AS
         SELECT 
             user_id,
-            DATE(recorded_at) as usage_date,
+            (recorded_at AT TIME ZONE {timezone_sql})::date as usage_date,
             SUM(prompt_tokens) as prompt_tokens,
             SUM(completion_tokens) as completion_tokens,
             SUM(total_tokens) as total_tokens,
             COUNT(*) as request_count
         FROM usage_records
-        GROUP BY user_id, DATE(recorded_at);
+        GROUP BY user_id, (recorded_at AT TIME ZONE {timezone_sql})::date;
 
         -- Monthly usage per user
-        CREATE OR REPLACE VIEW usage_monthly AS
+        CREATE VIEW usage_monthly AS
         SELECT 
             user_id,
-            DATE_TRUNC('month', recorded_at) as usage_month,
+            DATE_TRUNC('month', recorded_at AT TIME ZONE {timezone_sql}) as usage_month,
             SUM(prompt_tokens) as prompt_tokens,
             SUM(completion_tokens) as completion_tokens,
             SUM(total_tokens) as total_tokens,
             COUNT(*) as request_count
         FROM usage_records
-        GROUP BY user_id, DATE_TRUNC('month', recorded_at);
+        GROUP BY user_id, DATE_TRUNC('month', recorded_at AT TIME ZONE {timezone_sql});
 
-        -- Current usage summary (today + this month)
-        CREATE OR REPLACE VIEW usage_summary AS
+        -- Current usage summary (today + this month). Enumerates users tracked in
+        -- the plugin's own usage_records table and derives the tier solely from
+        -- native group membership via resolve_user_tier(). Per-user overrides win.
+        CREATE VIEW usage_summary AS
         SELECT 
-            ug.user_id,
-            ug.group_name,
-            ul.daily_token_limit,
-            ul.monthly_token_limit,
+            tracked.user_id,
+            array_to_string(r.tiers, ', ') as group_name,
+            COALESCE(uo.daily_token_limit, r.daily_limit) as daily_token_limit,
+            COALESCE(uo.monthly_token_limit, r.monthly_limit) as monthly_token_limit,
             COALESCE(daily.total_tokens, 0) as tokens_today,
             COALESCE(monthly.total_tokens, 0) as tokens_this_month,
             CASE 
-                WHEN ul.daily_token_limit = -1 THEN 100.0
-                ELSE ROUND(COALESCE(daily.total_tokens, 0)::NUMERIC / ul.daily_token_limit * 100, 2)
+                WHEN COALESCE(uo.daily_token_limit, r.daily_limit) = -1 THEN 100.0
+                ELSE ROUND(COALESCE(daily.total_tokens, 0)::NUMERIC / NULLIF(COALESCE(uo.daily_token_limit, r.daily_limit), 0) * 100, 2)
             END as daily_percent_used,
             CASE 
-                WHEN ul.monthly_token_limit = -1 THEN 100.0
-                ELSE ROUND(COALESCE(monthly.total_tokens, 0)::NUMERIC / ul.monthly_token_limit * 100, 2)
+                WHEN COALESCE(uo.monthly_token_limit, r.monthly_limit) = -1 THEN 100.0
+                ELSE ROUND(COALESCE(monthly.total_tokens, 0)::NUMERIC / NULLIF(COALESCE(uo.monthly_token_limit, r.monthly_limit), 0) * 100, 2)
             END as monthly_percent_used
-        FROM user_groups ug
-        JOIN usage_limits ul ON ug.group_name = ul.group_name
+        FROM (SELECT DISTINCT user_id FROM usage_records) tracked
+        CROSS JOIN LATERAL resolve_user_limits(tracked.user_id) r
+        LEFT JOIN user_limit_overrides uo ON uo.user_id = tracked.user_id
         LEFT JOIN (
             SELECT user_id, SUM(total_tokens) as total_tokens
             FROM usage_records
-            WHERE DATE(recorded_at) = CURRENT_DATE
+            WHERE (recorded_at AT TIME ZONE {timezone_sql})::date = (NOW() AT TIME ZONE {timezone_sql})::date
             GROUP BY user_id
-        ) daily ON ug.user_id = daily.user_id
+        ) daily ON tracked.user_id = daily.user_id
         LEFT JOIN (
             SELECT user_id, SUM(total_tokens) as total_tokens
             FROM usage_records
-            WHERE recorded_at >= DATE_TRUNC('month', CURRENT_DATE)
+            WHERE recorded_at >= (DATE_TRUNC('month', NOW() AT TIME ZONE {timezone_sql}) AT TIME ZONE {timezone_sql})
             GROUP BY user_id
-        ) monthly ON ug.user_id = monthly.user_id;
+        ) monthly ON tracked.user_id = monthly.user_id;
 
         -- Users approaching their limits (>80% used)
-        CREATE OR REPLACE VIEW users_near_limit AS
+        CREATE VIEW users_near_limit AS
         SELECT * FROM usage_summary
         WHERE daily_percent_used > 80 OR monthly_percent_used > 80
         ORDER BY monthly_percent_used DESC, daily_percent_used DESC;
@@ -266,81 +456,20 @@ class Filter:
         -- FUNCTIONS: Helper functions for the filter
         -- ============================================================================
 
-        -- Drop pre-1.0.1 signatures so the versions below replace them instead of overloading them
-        DROP FUNCTION IF EXISTS get_user_usage_status(VARCHAR);
-        DROP FUNCTION IF EXISTS record_usage(VARCHAR, INT, INT, VARCHAR, VARCHAR, VARCHAR);
-
-        -- Get user's current limits and usage in one call.
-        -- p_default_group: tier assumed for users with no user_groups row (the default_group valve).
-        CREATE OR REPLACE FUNCTION get_user_usage_status(
-            p_user_id VARCHAR(255),
-            p_default_group VARCHAR(50) DEFAULT 'freemium'
-        )
-        RETURNS TABLE (
-            group_name VARCHAR(50),
-            daily_limit BIGINT,
-            monthly_limit BIGINT,
-            tokens_today BIGINT,
-            tokens_this_month BIGINT,
-            is_over_daily BOOLEAN,
-            is_over_monthly BOOLEAN
-        ) AS $$
-        BEGIN
-            RETURN QUERY
-            SELECT 
-                COALESCE(ug.group_name, p_default_group)::VARCHAR(50) as group_name,
-                COALESCE(ul.daily_token_limit, 1000000) as daily_limit,
-                COALESCE(ul.monthly_token_limit, 10000000) as monthly_limit,
-                COALESCE(daily.total, 0) as tokens_today,
-                COALESCE(monthly.total, 0) as tokens_this_month,
-                CASE 
-                    WHEN COALESCE(ul.daily_token_limit, 1000000) = -1 THEN FALSE
-                    ELSE COALESCE(daily.total, 0) >= COALESCE(ul.daily_token_limit, 1000000)
-                END as is_over_daily,
-                CASE 
-                    WHEN COALESCE(ul.monthly_token_limit, 10000000) = -1 THEN FALSE
-                    ELSE COALESCE(monthly.total, 0) >= COALESCE(ul.monthly_token_limit, 10000000)
-                END as is_over_monthly
-            FROM (SELECT p_user_id as user_id) u
-            LEFT JOIN user_groups ug ON u.user_id = ug.user_id
-            LEFT JOIN usage_limits ul ON COALESCE(ug.group_name, p_default_group) = ul.group_name
-            LEFT JOIN (
-                SELECT ur.user_id, SUM(ur.total_tokens)::BIGINT as total
-                FROM usage_records ur
-                WHERE ur.user_id = p_user_id AND DATE(ur.recorded_at) = CURRENT_DATE
-                GROUP BY ur.user_id
-            ) daily ON TRUE
-            LEFT JOIN (
-                SELECT ur.user_id, SUM(ur.total_tokens)::BIGINT as total
-                FROM usage_records ur
-                WHERE ur.user_id = p_user_id AND ur.recorded_at >= DATE_TRUNC('month', CURRENT_DATE)
-                GROUP BY ur.user_id
-            ) monthly ON TRUE;
-        END;
-        $$ LANGUAGE plpgsql;
-
-        -- Record usage (simple insert wrapper).
-        -- p_default_group: tier new users are enrolled into (the default_group valve).
+        -- Record usage (simple insert wrapper). Group assignment for new users is
+        -- now handled by native Open WebUI group membership (see
+        -- get_user_usage_status), so this no longer auto-enrolls into user_groups.
         CREATE OR REPLACE FUNCTION record_usage(
             p_user_id VARCHAR(255),
             p_prompt_tokens INT,
             p_completion_tokens INT,
             p_model_id VARCHAR(255) DEFAULT NULL,
             p_pipeline_id VARCHAR(255) DEFAULT NULL,
-            p_chat_id VARCHAR(255) DEFAULT NULL,
-            p_default_group VARCHAR(50) DEFAULT 'freemium'
+            p_chat_id VARCHAR(255) DEFAULT NULL
         ) RETURNS VOID AS $$
         BEGIN
             INSERT INTO usage_records (user_id, prompt_tokens, completion_tokens, total_tokens, model_id, pipeline_id, chat_id)
             VALUES (p_user_id, p_prompt_tokens, p_completion_tokens, p_prompt_tokens + p_completion_tokens, p_model_id, p_pipeline_id, p_chat_id);
-
-            -- Auto-enrol the user in the default tier if they have no row yet.
-            -- Guarded by EXISTS so a default_group that names a missing tier cannot
-            -- violate the foreign key and abort the usage insert above.
-            INSERT INTO user_groups (user_id, group_name)
-            SELECT p_user_id, p_default_group
-            WHERE EXISTS (SELECT 1 FROM usage_limits WHERE group_name = p_default_group)
-            ON CONFLICT (user_id) DO NOTHING;
         END;
         $$ LANGUAGE plpgsql;
 
@@ -360,79 +489,119 @@ class Filter:
 
     def _ensure_schema(self, conn) -> bool:
         """
-        Create tables on first run; (re)apply views and functions on every run.
-        Returns True if the tables were created, False if they already existed.
+        Create tables/indexes if missing and (re)deploy views and functions.
+        Table/index DDL uses IF NOT EXISTS and views/functions use CREATE OR
+        REPLACE, so this always runs on every init - not just on first install -
+        to guarantee the deployed SQL (e.g. tier-resolution logic) never goes
+        stale relative to this file after a code change.
+        Returns True if the tables were newly created, False if they already existed.
         """
         with conn.cursor() as cur:
-            # Check if main table exists
+            # Check if main table exists (for logging only)
             cur.execute("""
                 SELECT EXISTS (
-                    SELECT FROM information_schema.tables
+                    SELECT FROM information_schema.tables 
                     WHERE table_name = 'usage_limits'
                 )
             """)
-            tables_exist = cur.fetchone()[0]
+            tables_existed = cur.fetchone()[0]
 
-            if tables_exist:
-                self._log("Usage tracking tables already exist", "debug")
-            else:
-                self._log("Creating usage tracking tables...")
-                cur.execute(self._get_tables_sql())
-
-            # Views and functions are idempotent and cheap; always apply so that
-            # upgrades of this filter take effect without manual migration.
-            cur.execute(self._get_routines_sql())
+            schema_sql = self._get_schema_sql()
+            cur.execute(schema_sql)
             conn.commit()
 
-            if not tables_exist:
+            if not tables_existed:
                 self._log("✅ Usage tracking schema created successfully")
+            else:
+                self._log("Usage tracking schema/views/functions redeployed", "debug")
+            return not tables_existed
 
-            # Warn if the configured default tier does not exist
-            cur.execute("SELECT 1 FROM usage_limits WHERE group_name = %s", (self.valves.default_group,))
-            if cur.fetchone() is None:
+    def _ensure_native_groups(self, conn):
+        """
+        Auto-create configured default tiers as native Open WebUI groups if they
+        don't already exist, so membership can be managed from the standard Groups
+        admin UI instead of a filter-specific table.
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT name FROM "group" WHERE name = ANY(%s)',
+                ([tier["group_name"] for tier in DEFAULT_TIERS],),
+            )
+            existing_names = {row[0] for row in cur.fetchall()}
+
+            for tier in DEFAULT_TIERS:
+                if tier["group_name"] in existing_names:
+                    continue
+
+                now = int(time.time())
+                cur.execute(
+                    """
+                    INSERT INTO "group" (id, user_id, name, description, data, meta, permissions, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        "",
+                        tier["group_name"],
+                        tier["description"],
+                        json.dumps(
+                            {
+                                "daily_token_limit": tier["daily_token_limit"],
+                                "monthly_token_limit": tier["monthly_token_limit"],
+                            }
+                        ),
+                        json.dumps({}),
+                        json.dumps({}),
+                        now,
+                        now,
+                    ),
+                )
+                self._log(f"Created native group '{tier['group_name']}'")
+            conn.commit()
+
+    def _enroll_users_without_default_tier(self, conn):
+        """
+        Put every user who has no default (built-in) tier group into the configured
+        default group. Custom tier memberships do not count as a default
+        tier. Runs on every plugin load and is a no-op when nobody is missing one.
+        """
+        tier_names = [tier["group_name"] for tier in DEFAULT_TIERS]
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT id FROM "group" WHERE name = %s',
+                (self.valves.default_group,),
+            )
+            row = cur.fetchone()
+            if not row:
+                self._log("Cannot enroll users in the default tier: group not found", "error")
+                return
+            default_group_id = row[0]
+
+            now = int(time.time())
+            cur.execute(
+                """
+                INSERT INTO group_member (id, group_id, user_id, created_at, updated_at)
+                SELECT gen_random_uuid()::text, %s, u.id, %s, %s
+                FROM "user" u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM group_member gm
+                    JOIN "group" g ON g.id = gm.group_id
+                    WHERE gm.user_id = u.id AND g.name = ANY(%s)
+                )
+                ON CONFLICT (group_id, user_id) DO NOTHING
+                """,
+                (default_group_id, now, now, tier_names),
+            )
+            enrolled = cur.rowcount
+            conn.commit()
+            if enrolled:
                 self._log(
-                    f"default_group '{self.valves.default_group}' is not defined in usage_limits. "
-                    f"Unassigned users get fallback limits (1M/day, 10M/month) and will not be auto-enrolled.",
-                    "warning",
+                    f"Enrolled {enrolled} user(s) with no default tier into "
+                    f"{self.valves.default_group}"
                 )
 
-            return not tables_exist
-
-    def _connect(self):
-        """Blocking: open the connection pool and ensure the schema. Runs in a worker thread."""
-        url = urlparse(self.valves.postgres_url.strip())
-        if url.scheme not in ("http", "https", "postgresql", "postgres") or not url.hostname:
-            raise ValueError(
-                "Valve postgres_url must be scheme://host or scheme://host:port, "
-                "e.g. http://langgraph-pgvector or http://10.5.10.100:5432."
-            )
-        host, port = url.hostname, url.port or 5432
-        conn_string = (
-            f"postgresql://{self.valves.postgres_user}:"
-            f"{quote_plus(self.valves.postgres_password)}@"
-            f"{host}:{port}/"
-            f"{self.valves.postgres_database}"
-        )
-
-        self._log(f"Connecting to PostgreSQL at {host}:{port}")
-
-        pool = psycopg_pool.ConnectionPool(
-            conninfo=conn_string,
-            min_size=1,
-            max_size=5,
-            open=True,
-        )
-
-        with pool.connection() as conn:
-            if self._ensure_schema(conn):
-                self._log("Schema was auto-created on first run")
-            else:
-                self._log("Using existing schema", "debug")
-
-        return pool
-
     async def _initialize(self):
-        """Initialize PostgreSQL connection pool and ensure schema exists (once, without blocking the event loop)"""
+        """Initialize once; the lock stops concurrent first prompts from racing the schema setup."""
         if self._initialized:
             return
 
@@ -440,25 +609,121 @@ class Filter:
             if self._initialized:
                 return
             try:
-                self._pool = await asyncio.to_thread(self._connect)
+                await asyncio.to_thread(self._connect)
                 self._initialized = True
                 self._log("Usage tracking initialized successfully")
             except Exception as e:
                 self._log(f"Failed to initialize: {e}", "error")
                 raise
 
+    def _connect(self):
+        """Blocking: create the connection pool and run schema/group setup. Run via to_thread."""
+        conn_string = (
+            f"postgresql://{self.valves.postgres_user}:"
+            f"{quote_plus(self.valves.postgres_password)}@"
+            f"{self.valves.postgres_host}:{self.valves.postgres_port}/"
+            f"{self.valves.postgres_database}"
+        )
+
+        self._log(
+            f"Connecting to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}"
+        )
+
+        # Create connection pool
+        self._pool = psycopg_pool.ConnectionPool(
+            conninfo=conn_string,
+            min_size=1,
+            max_size=5,
+            open=True,
+        )
+
+        # Ensure schema exists (auto-create if needed). Each setup step is
+        # isolated so a failure in one (e.g. native group tables not being
+        # reachable) can't abort the connection pool setup and take the
+        # whole filter - including the usage meter - down with it.
+        with self._pool.connection() as conn:
+            try:
+                schema_created = self._ensure_schema(conn)
+                if schema_created:
+                    self._log("Schema was auto-created on first run")
+                else:
+                    self._log("Using existing schema", "debug")
+            except Exception as e:
+                conn.rollback()
+                self._log(f"Schema setup failed: {e}", "error")
+
+            # Ensure the native Open WebUI groups for each tier exist
+            try:
+                self._ensure_native_groups(conn)
+            except Exception as e:
+                conn.rollback()
+                self._log(f"Native tier group setup failed: {e}", "error")
+
+            # Everyone without a default tier joins the configured default group
+            try:
+                self._enroll_users_without_default_tier(conn)
+            except Exception as e:
+                conn.rollback()
+                self._log(f"Default tier enrollment failed: {e}", "error")
+
+    @staticmethod
+    def _fmt_tokens(n: int) -> str:
+        for size, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+            if n >= size:
+                return f"{n/size:.1f}{suffix}"
+        return str(n)
+
+    @staticmethod
+    def _tier_label(group_name: str) -> str:
+        """Label for one tier or a comma separated list of every tier the user is in."""
+        names = [
+            n.strip().removeprefix(TIER_GROUP_PREFIX)
+            for n in (group_name or "").split(",")
+            if n.strip()
+        ]
+        return ", ".join(n.title() for n in names) if names else "Unknown"
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        seconds = max(int(seconds), 0)
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        if days:
+            return f"{days}d {hours}h"
+        if hours:
+            return f"{hours}h {minutes}m"
+        return f"{max(minutes, 1)}m"
+
+    def _get_reset_times(self, cur) -> Dict[str, float]:
+        """Seconds until the daily/monthly windows roll over, per the DB clock/timezone
+        (the same clock the usage queries use), so messages never disagree with enforcement."""
+        timezone_sql = self._sql_string_literal(self.valves.usage_timezone)
+        cur.execute(
+            f"""
+            SELECT
+                EXTRACT(EPOCH FROM ((((NOW() AT TIME ZONE {timezone_sql})::date + 1)::timestamp AT TIME ZONE {timezone_sql}) - NOW())),
+                EXTRACT(EPOCH FROM (((DATE_TRUNC('month', NOW() AT TIME ZONE {timezone_sql}) + INTERVAL '1 month') AT TIME ZONE {timezone_sql}) - NOW())),
+                {timezone_sql}
+            """
+        )
+        daily, monthly, tz = cur.fetchone()
+        return {
+            "daily_reset_seconds": float(daily),
+            "monthly_reset_seconds": float(monthly),
+            "timezone": tz,
+        }
+
     def _get_user_status(self, user_id: str) -> Dict[str, Any]:
         """Get user's current usage status from PostgreSQL"""
         try:
+            assert self._pool is not None
             with self._pool.connection() as conn:
                 with conn.cursor() as cur:
-                    # Use the helper function we created
-                    cur.execute(
-                        "SELECT * FROM get_user_usage_status(%s, %s)",
-                        (user_id, self.valves.default_group),
-                    )
+                    cur.execute("SELECT * FROM get_user_usage_status(%s)", (user_id,))
                     row = cur.fetchone()
-                    
+                    resets = self._get_reset_times(cur)
+
                     if row:
                         return {
                             "group_name": row[0],
@@ -468,22 +733,14 @@ class Filter:
                             "tokens_this_month": row[4],
                             "is_over_daily": row[5],
                             "is_over_monthly": row[6],
+                            "limit_source": row[7],
+                            **resets,
                         }
-                    
-                    # Fallback: user not found, return defaults
-                    return {
-                        "group_name": self.valves.default_group,
-                        "daily_limit": 1000000,
-                        "monthly_limit": 10000000,
-                        "tokens_today": 0,
-                        "tokens_this_month": 0,
-                        "is_over_daily": False,
-                        "is_over_monthly": False,
-                    }
-                    
+
+            raise RuntimeError("get_user_usage_status returned no row")
+
         except Exception as e:
-            self._log(f"Failed to get user status: {e}", "error")
-            # On error, allow the request (fail open)
+            self._log(f"Failed to get user status (failing open): {e}", "error")
             return {
                 "group_name": "unknown",
                 "daily_limit": -1,
@@ -492,6 +749,10 @@ class Filter:
                 "tokens_this_month": 0,
                 "is_over_daily": False,
                 "is_over_monthly": False,
+                "limit_source": "error",
+                "daily_reset_seconds": 0.0,
+                "monthly_reset_seconds": 0.0,
+                "timezone": "",
             }
 
     def _record_usage(
@@ -501,24 +762,57 @@ class Filter:
         completion_tokens: int,
         model_id: Optional[str] = None,
         pipeline_id: Optional[str] = None,
-        chat_id: Optional[str] = None
+        chat_id: Optional[str] = None,
     ):
         """Record token usage to PostgreSQL"""
         try:
+            assert self._pool is not None
             with self._pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT record_usage(%s, %s, %s, %s, %s, %s, %s)",
-                        (user_id, prompt_tokens, completion_tokens, model_id, pipeline_id, chat_id,
-                         self.valves.default_group)
+                        "SELECT record_usage(%s, %s, %s, %s, %s, %s)",
+                        (
+                            user_id,
+                            prompt_tokens,
+                            completion_tokens,
+                            model_id,
+                            pipeline_id,
+                            chat_id,
+                        ),
                     )
                 conn.commit()
-                
+
             total = prompt_tokens + completion_tokens
             self._log(f"Recorded {total} tokens for user {user_id[:8]}...", "debug")
-            
+
         except Exception as e:
             self._log(f"Failed to record usage: {e}", "error")
+
+    def _build_limit_message(self, status: Dict[str, Any]) -> Dict[str, str]:
+        """Human-readable over-limit text. The daily limit is reported first, but if
+        the monthly limit is also exhausted the reset time is the later (monthly) one."""
+        if status["is_over_monthly"]:
+            limit_type, limit_val, used_val = (
+                "monthly",
+                status["monthly_limit"],
+                status["tokens_this_month"],
+            )
+            wait = self._fmt_duration(status["monthly_reset_seconds"])
+        else:
+            limit_type, limit_val, used_val = (
+                "daily",
+                status["daily_limit"],
+                status["tokens_today"],
+            )
+            wait = self._fmt_duration(status["daily_reset_seconds"])
+
+        message = (
+            f"You've reached your {limit_type} usage limit "
+            f"({used_val:,} of {limit_val:,} tokens, tier: {self._tier_label(status['group_name'])}). "
+            f"New messages are paused and will be available again in about {wait}. "
+            f"Contact your administrator if you need a higher limit."
+        )
+        return {"type": limit_type, "message": message, "wait": wait}
 
     async def inlet(
         self,
@@ -528,107 +822,132 @@ class Filter:
         __request__: Optional[Request] = None,
     ) -> Dict[str, Any]:
         """
-        Inlet: Check user's usage against limits before processing
+        Inlet: Check user's usage against limits before processing.
+
+        When the user is over a limit the request is rejected here by raising,
+        BEFORE anything is sent to the model. Open WebUI turns the exception into
+        an error banner on the assistant message plus a toast, so nothing is
+        injected into the prompt and no tokens are spent.
         """
         self._log("=== INLET START ===", "debug")
-        
+
         if not __user__ or not __user__.get("id"):
             self._log("No user ID, skipping usage check", "debug")
             return body
-        
+
         user_id = __user__["id"]
         user_role = __user__.get("role", "user")
         is_admin = self.valves.admin_bypass and user_role == "admin"
-        
+
         try:
-            # Initialize if needed
             if not self._initialized:
                 await self._initialize()
-            
-            # Get user's current status (always, for all users including admins)
             status = await asyncio.to_thread(self._get_user_status, user_id)
-
-            self._log(
-                f"User {user_id[:8]}... ({status['group_name']}): "
-                f"{status['tokens_today']}/{status['daily_limit']} today, "
-                f"{status['tokens_this_month']}/{status['monthly_limit']} this month",
-                "debug"
-            )
-
-            # Show current usage status unless disabled globally or by this user
-            if self.valves.show_usage_status and self._user_wants_status(__user__) and __event_emitter__:
-                daily_percent = 0 if status["daily_limit"] == -1 else (status["tokens_today"] / status["daily_limit"] * 100)
-                monthly_percent = 0 if status["monthly_limit"] == -1 else (status["tokens_this_month"] / status["monthly_limit"] * 100)
-                
-                def fmt_tokens(n):
-                    return f"{n/1000:.1f}K" if n >= 1000 else str(n)
-                
-                tokens_today = fmt_tokens(status["tokens_today"])
-                daily_limit = fmt_tokens(status["daily_limit"]) if status["daily_limit"] != -1 else "∞"
-                tokens_month = fmt_tokens(status["tokens_this_month"])
-                monthly_limit = fmt_tokens(status["monthly_limit"]) if status["monthly_limit"] != -1 else "∞"
-                
-                is_warning = daily_percent >= self.valves.warn_at_percent or monthly_percent >= self.valves.warn_at_percent
-                icon = "⚠️" if is_warning else "📊"
-                
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"{icon} Usage: {tokens_today}/{daily_limit} today ({daily_percent:.0f}%) • {tokens_month}/{monthly_limit} month ({monthly_percent:.0f}%)",
-                        "done": True
-                    }
-                })
-            
-            # Check if over limits (admin bypass only affects blocking, not display)
-            if status["is_over_daily"] or status["is_over_monthly"]:
-                if self.valves.enable_blocking and not is_admin:
-                    # Determine which limit was hit
-                    if status["is_over_daily"]:
-                        limit_type = "daily"
-                        limit_val = status["daily_limit"]
-                        used_val = status["tokens_today"]
-                        reset_info = "midnight UTC"
-                    else:
-                        limit_type = "monthly"
-                        limit_val = status["monthly_limit"]
-                        used_val = status["tokens_this_month"]
-                        reset_info = "the 1st of next month"
-                    
-                    error_msg = (
-                        f"⚠️ **Usage Limit Reached**\n\n"
-                        f"You've reached your {limit_type} token limit for the **{status['group_name']}** tier.\n\n"
-                        f"- **Used:** {used_val:,} tokens\n"
-                        f"- **Limit:** {limit_val:,} tokens\n"
-                        f"- **Resets:** {reset_info}\n\n"
-                        f"Contact your administrator to upgrade your plan."
-                    )
-                    
-                    self._log(f"User {user_id[:8]}... blocked: over {limit_type} limit", "info")
-                    
-                    if __event_emitter__:
-                        await __event_emitter__({
-                            "type": "status",
-                            "data": {
-                                "description": f"❌ {limit_type.title()} limit reached",
-                                "done": True
-                            }
-                        })
-                    
-                    # Raising stops the request; Open WebUI returns the message as a chat error
-                    raise UsageLimitExceeded(error_msg)
-                elif is_admin:
-                    self._log(f"Admin user {user_id[:8]}... over limit but bypassing block", "debug")
-                else:
-                    self._log(f"User {user_id[:8]}... over limit but blocking disabled", "warning")
-
-        except UsageLimitExceeded:
-            raise
         except Exception as e:
-            self._log(f"Inlet error: {e}", "error")
-            # Fail open - allow request on error
-        
+            self._log(f"Inlet error (failing open): {e}", "error")
+            return body
+
+        self._log(
+            f"User {user_id[:8]}... tier={status['group_name']} "
+            f"({status['limit_source']}): "
+            f"{status['tokens_today']}/{status['daily_limit']} today, "
+            f"{status['tokens_this_month']}/{status['monthly_limit']} this month, "
+            f"over_daily={status['is_over_daily']} over_monthly={status['is_over_monthly']}",
+            "debug",
+        )
+
+        try:
+            if self.valves.show_usage_status and __event_emitter__:
+                daily_percent = (
+                    0
+                    if status["daily_limit"] == -1
+                    else status["tokens_today"] / max(status["daily_limit"], 1) * 100
+                )
+                monthly_percent = (
+                    0
+                    if status["monthly_limit"] == -1
+                    else status["tokens_this_month"]
+                    / max(status["monthly_limit"], 1)
+                    * 100
+                )
+                fmt = self._fmt_tokens
+                daily_limit = fmt(status["daily_limit"]) if status["daily_limit"] != -1 else "∞"
+                monthly_limit = fmt(status["monthly_limit"]) if status["monthly_limit"] != -1 else "∞"
+                is_warning = max(daily_percent, monthly_percent) >= self.valves.warn_at_percent
+                icon = "⚠️" if is_warning else "📊"
+
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": (
+                                f"{icon} Token Usage: {fmt(status['tokens_today'])}/{daily_limit} Today "
+                                f"({daily_percent:.0f}%) • {fmt(status['tokens_this_month'])}/"
+                                f"{monthly_limit} Month ({monthly_percent:.0f}%) • "
+                                f"Tier: {self._tier_label(status['group_name'])}"
+                            ),
+                            "done": True,
+                        },
+                    }
+                )
+        except Exception as e:
+            self._log(f"Usage status emit failed: {e}", "warning")
+
+        if status["is_over_daily"] or status["is_over_monthly"]:
+            if self.valves.enable_blocking and not is_admin:
+                info = self._build_limit_message(status)
+                self._log(
+                    f"BLOCK user {user_id[:8]}...: over {info['type']} limit "
+                    f"(tier={status['group_name']})",
+                    "info",
+                )
+
+                if __event_emitter__:
+                    try:
+                        await __event_emitter__(
+                            {
+                                "type": "notification",
+                                "data": {"type": "error", "content": info["message"]},
+                            }
+                        )
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"❌ {info['type'].title()} limit reached - resets in {info['wait']}",
+                                    "done": True,
+                                },
+                            }
+                        )
+                    except Exception as e:
+                        self._log(f"Block notification emit failed: {e}", "warning")
+
+                # Aborts the turn; raised outside any try/except so it is not swallowed.
+                raise Exception(info["message"])
+            elif is_admin:
+                self._log(f"Admin {user_id[:8]}... over limit, bypassing block", "debug")
+            else:
+                self._log(f"User {user_id[:8]}... over limit but blocking disabled", "warning")
+
         self._log("=== INLET COMPLETE ===", "debug")
         return body
+
+    @staticmethod
+    def _extract_usage(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Find usage for the message produced by THIS turn only. Falling back to an
+        older assistant message would re-record (double count) a previous turn's tokens."""
+        message_id = body.get("id")
+        messages = body.get("messages") or []
+        target = None
+        if message_id:
+            target = next((m for m in messages if m.get("id") == message_id), None)
+        if target is None:
+            target = next(
+                (m for m in reversed(messages) if m.get("role") == "assistant"), None
+            )
+        if target and target.get("usage"):
+            return target["usage"]
+        return body.get("usage") or None
 
     async def outlet(
         self,
@@ -642,111 +961,93 @@ class Filter:
         """
         self._log("=== OUTLET START ===", "debug")
 
-        # Outlet body is built fresh by Open WebUI; nothing from inlet survives
-        user_id = __user__.get("id") if __user__ else None
-
+        user_id = (__user__ or {}).get("id")
         if not user_id:
             self._log("No user ID in outlet, skipping", "debug")
             return body
-        
+
         try:
             if not self._initialized:
                 await self._initialize()
-            
-            # Extract usage from response
-            # Open WebUI puts this in various places depending on the model
-            usage = None
-            
-            # Check body directly
-            if "usage" in body:
-                usage = body["usage"]
-            
-            # Check in messages (assistant message might have usage)
-            messages = body.get("messages", [])
-            for msg in reversed(messages):
-                if msg.get("role") == "assistant" and "usage" in msg:
-                    usage = msg["usage"]
-                    break
-            
-            if usage:
-                # Open WebUI normalizes usage: input_tokens/output_tokens are cumulative across
-                # tool-call round trips, while prompt_tokens/completion_tokens hold only the last call.
-                prompt_tokens = (
-                    usage.get("input_tokens", 0)
-                    or usage.get("prompt_tokens", 0)
-                    or usage.get("prompt_eval_count", 0)
-                    or 0
-                )
-                completion_tokens = (
-                    usage.get("output_tokens", 0)
-                    or usage.get("completion_tokens", 0)
-                    or usage.get("eval_count", 0)
-                    or 0
-                )
-                
-                if prompt_tokens > 0 or completion_tokens > 0:
-                    await asyncio.to_thread(
-                        self._record_usage,
-                        user_id,
-                        prompt_tokens,
-                        completion_tokens,
-                        body.get("model"),
-                        None,
-                        body.get("chat_id"),
-                    )
 
-                    total = prompt_tokens + completion_tokens
-                    self._log(f"Recorded {total} tokens for user {user_id[:8]}...", "info")
-
-                    # Check if user has now exceeded limits after this usage
-                    status = await asyncio.to_thread(self._get_user_status, user_id)
-                    daily_percent = 0 if status["daily_limit"] == -1 else (status["tokens_today"] / status["daily_limit"] * 100)
-                    monthly_percent = 0 if status["monthly_limit"] == -1 else (status["tokens_this_month"] / status["monthly_limit"] * 100)
-                    
-                    # If over limit or near limit, append warning to the actual chat response
-                    if status["is_over_daily"] or status["is_over_monthly"] or daily_percent >= self.valves.warn_at_percent or monthly_percent >= self.valves.warn_at_percent:
-                        def fmt_tokens(n):
-                            return f"{n/1000:.1f}K" if n >= 1000 else str(n)
-                        
-                        tokens_today = fmt_tokens(status["tokens_today"])
-                        daily_limit = fmt_tokens(status["daily_limit"]) if status["daily_limit"] != -1 else "∞"
-                        tokens_month = fmt_tokens(status["tokens_this_month"])
-                        monthly_limit = fmt_tokens(status["monthly_limit"]) if status["monthly_limit"] != -1 else "∞"
-                        
-                        # Build warning message
-                        if status["is_over_daily"] or status["is_over_monthly"]:
-                            warning_msg = (
-                                f"\n\n---\n"
-                                f"⚠️ **Usage Limit Reached**\n\n"
-                                f"You've reached your {'daily' if status['is_over_daily'] else 'monthly'} limit for the **{status['group_name']}** tier.\n"
-                                f"- Today: {tokens_today}/{daily_limit} ({daily_percent:.0f}%)\n"
-                                f"- This month: {tokens_month}/{monthly_limit} ({monthly_percent:.0f}%)\n\n"
-                                f"Your next request will be blocked until the limit resets."
-                            )
-                        else:
-                            warning_msg = (
-                                f"\n\n---\n"
-                                f"⚠️ **Approaching Usage Limit**\n\n"
-                                f"- Today: {tokens_today}/{daily_limit} ({daily_percent:.0f}%)\n"
-                                f"- This month: {tokens_month}/{monthly_limit} ({monthly_percent:.0f}%)"
-                            )
-                        
-                        # Append warning to the last assistant message
-                        messages = body.get("messages", [])
-                        for i in range(len(messages) - 1, -1, -1):
-                            if messages[i].get("role") == "assistant":
-                                if isinstance(messages[i].get("content"), str):
-                                    messages[i]["content"] += warning_msg
-                                break
-                        
-                        self._log(f"Added usage warning to chat for user {user_id[:8]}...", "info")
-                else:
-                    self._log("Usage found but no tokens to record", "debug")
-            else:
+            usage = self._extract_usage(body)
+            if not usage:
                 self._log("No usage data in response", "debug")
-                
+                return body
+
+            # Open WebUI normalizes usage to input/output_tokens but keeps the
+            # provider's original keys (OpenAI prompt/completion, Ollama eval_count).
+            prompt_tokens = int(
+                usage.get("input_tokens")
+                or usage.get("prompt_tokens")
+                or usage.get("prompt_eval_count")
+                or 0
+            )
+            completion_tokens = int(
+                usage.get("output_tokens")
+                or usage.get("completion_tokens")
+                or usage.get("eval_count")
+                or 0
+            )
+            if prompt_tokens == 0 and completion_tokens == 0:
+                total = int(usage.get("total_tokens") or 0)
+                completion_tokens = total
+
+            if prompt_tokens <= 0 and completion_tokens <= 0:
+                self._log("Usage found but no tokens to record", "debug")
+                return body
+
+            await asyncio.to_thread(
+                self._record_usage,
+                user_id=user_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                model_id=body.get("model"),
+                chat_id=body.get("chat_id"),
+            )
+            self._log(
+                f"Recorded {prompt_tokens + completion_tokens} tokens for user {user_id[:8]}...",
+                "info",
+            )
+
+            status = await asyncio.to_thread(self._get_user_status, user_id)
+            daily_percent = (
+                0
+                if status["daily_limit"] == -1
+                else status["tokens_today"] / max(status["daily_limit"], 1) * 100
+            )
+            monthly_percent = (
+                0
+                if status["monthly_limit"] == -1
+                else status["tokens_this_month"] / max(status["monthly_limit"], 1) * 100
+            )
+            is_over = status["is_over_daily"] or status["is_over_monthly"]
+            is_near = max(daily_percent, monthly_percent) >= self.valves.warn_at_percent
+
+            if (is_over or is_near) and __event_emitter__:
+                if is_over:
+                    info = self._build_limit_message(status)
+                    notif_type, notif_msg = "error", info["message"]
+                else:
+                    fmt = self._fmt_tokens
+                    daily_limit = fmt(status["daily_limit"]) if status["daily_limit"] != -1 else "∞"
+                    monthly_limit = fmt(status["monthly_limit"]) if status["monthly_limit"] != -1 else "∞"
+                    notif_type = "warning"
+                    notif_msg = (
+                        f"Approaching usage limit. Today: {fmt(status['tokens_today'])}/{daily_limit} "
+                        f"({daily_percent:.0f}%), this month: {fmt(status['tokens_this_month'])}/"
+                        f"{monthly_limit} ({monthly_percent:.0f}%)."
+                    )
+                await __event_emitter__(
+                    {
+                        "type": "notification",
+                        "data": {"type": notif_type, "content": notif_msg},
+                    }
+                )
+                self._log(f"Sent usage notification to user {user_id[:8]}...", "info")
+
         except Exception as e:
             self._log(f"Outlet error: {e}", "error")
-        
+
         self._log("=== OUTLET COMPLETE ===", "debug")
         return body
