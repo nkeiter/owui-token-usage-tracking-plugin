@@ -4,7 +4,7 @@ This project is Gettysburg College's fork of Beau D'Amore's MIT-licensed
 [Open WebUI Usage Tracking Filter](https://github.com/beaudamore/openwebui-usage-tracking-filter).
 Fork developer: Nathan I Keiter.
 It tracks token usage in PostgreSQL, applies daily and monthly limits, and uses
-native Open WebUI groups to determine each user's tier. Deployment-specific
+native [Open WebUI](https://github.com/open-webui/open-webui) groups to determine each user's tier. Deployment-specific
 settings are configurable so other organizations can adapt the plugin to meet
 thier specific needs.
 
@@ -137,7 +137,7 @@ to resolve tier membership.
    must also have a corresponding row in the plugin's `usage_limits` table,
    with its daily and monthly limits configured. Create and configure custom
    tiers through the database or one of the management tools below.
-3. **`owui_token_usage_admin.py` CLI (improved):** Provides commands for assigning a
+3. **[`owui_token_usage_admin.py`](https://github.com/nkeiter/owui-token-usage-admin) CLI (improved):** Provides commands for assigning a
    user to exactly one tier, managing limits and overrides, and reviewing
    usage. It is currently run from an AWS container shell. Its commands are:
    `list-limits` (show tier limits and overrides), `list-members` (show tier
@@ -151,9 +151,10 @@ to resolve tier membership.
    custom tiers with limits and members from one CSV, with a summary and
    `--dry-run`), `set-user-limit`, `clear-user-limit`, `show-user`,
    `audit-tiers` (find users in several or no default tier groups), and `usage-report`
-   (report usage against quotas). This CLI is maintained separately and is not
-   part of this filter repository.
-4. **Usage management console (advanced):** A graphical interface for tier
+   (report usage against quotas). This CLI is maintained separately in the
+   [owui-token-usage-admin](https://github.com/nkeiter/owui-token-usage-admin)
+   repository and is not part of this filter repository.
+4. **[Usage management console](https://github.com/nkeiter/owui-token-usage-management-console) (advanced):** A graphical interface for tier
    membership, limits, overrides, and reports, hosted as a small AWS Lambda
    website. Its pages include a dashboard; user search, tier assignment and
    override management; tier management (edit limits, **Add New** custom
@@ -163,7 +164,9 @@ to resolve tier membership.
    date-range and optional per-user reports with charts and CSV export; and a
    tier audit for users in several or no default tier groups. Navigate with
    `/#dashboard`, `/#users`, `/#tiers`, `/#reports`, and `/#tier-audit`. The
-   console is maintained separately and is not part of this filter repository.
+   console is maintained separately in the
+   [owui-token-usage-management-console](https://github.com/nkeiter/owui-token-usage-management-console)
+   repository and is not part of this filter repository.
 
 The CLI and console currently require AWS hosting/integration, AWS Secrets
 Manager access for the database connection secret, and environment-variable
@@ -226,6 +229,34 @@ This fork is distributed under the MIT License. The LICENSE file retains
 Beau D'Amore's original copyright notice and adds a separate notice for Nathan
 I Keiter's copyrightable contributions to this fork. Copyright is not claimed
 over the original author's work.
+
+## Acknowledgements
+
+This plugin builds on the foundational work of Beau D'Amore, author of the
+original [Open WebUI Usage Tracking Filter](https://github.com/beaudamore/openwebui-usage-tracking-filter).
+Thank you, Beau, for creating and openly sharing that project under the MIT
+License. Its design and implementation made this fork possible, and we are
+grateful for the opportunity to build upon it.
+
+Thanks also to the [Open WebUI](https://github.com/open-webui/open-webui)
+project and its contributors, whose platform underpins everything here.
+
+## Related projects
+
+These projects work together with this plugin. The management tools require
+this plugin to be installed and configured, because they operate on the usage
+tables and tier groups it creates.
+
+- [owui-token-usage-admin](https://github.com/nkeiter/owui-token-usage-admin):
+  command-line tool for managing tiers, limits, overrides, and usage reports.
+- [owui-token-usage-management-console](https://github.com/nkeiter/owui-token-usage-management-console):
+  graphical (web) version of the admin CLI, deployed as an AWS Lambda app.
+
+### Other related work by this author
+
+- [owui-scim-admin](https://github.com/nkeiter/owui-scim-admin): stand-alone
+  command-line utility for administering Open WebUI users and groups through
+  its SCIM 2.0 API.
 
 ## Configuration reference
 
